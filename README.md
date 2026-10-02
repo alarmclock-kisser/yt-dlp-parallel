@@ -15,7 +15,7 @@
 
 yt-dlp is a feature-rich command-line audio/video downloader with support for [thousands of sites](supportedsites.md). The project is a fork of [youtube-dl](https://github.com/ytdl-org/youtube-dl) based on the now inactive [youtube-dlc](https://github.com/blackjack4494/yt-dlc).
 
-> **-np Fork ([alarmclock-kisser/yt-dlp-parallel](https://github.com/alarmclock-kisser/yt-dlp-parallel)):** Basis ist yt-dlp stable `2026.08.19`, die Version meldet `2026.08.19-np`. Neu: `--n-parallel N` lädt N Videos parallel (Playlist-Einträge / mehrere URLs, kombinierbar mit `-N` für Fragmente), mit den Modi `--n-parallel-batch` und `--n-parallel-continuous` (Default). **Fertige Binaries ohne Bauen:** [Releases](https://github.com/alarmclock-kisser/yt-dlp-parallel/releases) — `yt-dlp-np.exe` (Windows), `yt-dlp-np` (Linux/macOS, `chmod +x`), plus `SHA256SUMS.txt`. Beispiel: `yt-dlp-np --n-parallel 8 -N 4 <playlist-url>`.
+> **-np Fork ([alarmclock-kisser/yt-dlp-parallel](https://github.com/alarmclock-kisser/yt-dlp-parallel)):** Basis ist yt-dlp stable `2026.08.19`, die Version meldet `2026.08.19-np`. Neu: `--n-parallel N` lädt N Videos parallel (Playlist-Einträge / mehrere URLs, kombinierbar mit `-N` für Fragmente), mit den Modi `--n-parallel-batch` und `--n-parallel-continuous` (Default). **Fertige Binaries ohne Bauen:** [Releases](https://github.com/alarmclock-kisser/yt-dlp-parallel/releases) — `yt-dlp.exe` (Windows), `yt-dlp` (Linux/macOS, `chmod +x`), plus `SHA256SUMS.txt`. Beispiel: `yt-dlp --n-parallel 8 -N 4 <playlist-url>`.
 
 <!-- MANPAGE: MOVE "USAGE AND OPTIONS" SECTION HERE -->
 
