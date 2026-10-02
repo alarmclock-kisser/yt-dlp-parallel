@@ -89,7 +89,9 @@ def exe(onedir):
 
 
 def version_to_list(version):
-    version_list = version.split('.')
+    # -np fork: strip suffixes like "-np" for numeric Windows version resource
+    version_core = version.split('-')[0].split('+')[0]
+    version_list = version_core.split('.')
     return list(map(int, version_list)) + [0] * (4 - len(version_list))
 
 
