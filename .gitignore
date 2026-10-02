@@ -119,6 +119,7 @@ yt-dlp.zip
 .idea
 *.iml
 .vscode
+.vs/
 *.sublime-*
 *.code-workspace
 *.swp
