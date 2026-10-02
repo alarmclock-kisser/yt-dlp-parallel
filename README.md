@@ -556,6 +556,28 @@ Tip: Use `CTRL`+`F` (or `Command`+`F`)  to search by keywords
     -N, --concurrent-fragments N    Number of fragments of a dash/hlsnative
                                     video that should be downloaded concurrently
                                     (default is 1)
+    --n-parallel N                  Download N videos in parallel (playlist
+                                    entries / multiple URLs). Unlike
+                                    -N/--concurrent-fragments, which
+                                    parallelizes fragments within a single
+                                    video, --n-parallel parallelizes whole
+                                    videos. Combinable with -N: X parallel
+                                    downloads with Y concurrent fragments each.
+                                    Default mode is continuous pool scheduling;
+                                    see --n-parallel-batch and --n-parallel-
+                                    continuous
+    --n-parallel-batch              Batch mode for --n-parallel: always start
+                                    groups of N downloads together and only
+                                    start the next group once all downloads of
+                                    the current group are finished. Only valid
+                                    together with --n-parallel and mutually
+                                    exclusive with --n-parallel-continuous
+    --n-parallel-continuous         Continuous pool-scheduling mode for
+                                    --n-parallel (default): keep N downloads
+                                    running, starting further tasks whenever a
+                                    slot frees up. Only valid together with
+                                    --n-parallel and mutually exclusive with
+                                    --n-parallel-batch
     -r, --limit-rate RATE           Maximum download rate in bytes per second,
                                     e.g. 50K or 4.2M
     --throttled-rate RATE           Minimum download rate in bytes per second

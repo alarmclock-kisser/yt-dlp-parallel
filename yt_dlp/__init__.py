@@ -218,6 +218,15 @@ def validate_options(opts):
     validate_positive('autonumber start', opts.autonumber_start)
     validate_positive('autonumber size', opts.autonumber_size, True)
     validate_positive('concurrent fragments', opts.concurrent_fragment_downloads, True)
+    validate_positive('parallel downloads', opts.n_parallel, True)
+    validate(
+        not (opts.n_parallel_batch or opts.n_parallel_continuous) or opts.n_parallel is not None,
+        '--n-parallel-batch/--n-parallel-continuous',
+        msg='{name} requires --n-parallel to be specified')
+    validate(
+        not (opts.n_parallel_batch and opts.n_parallel_continuous),
+        '--n-parallel-batch/--n-parallel-continuous',
+        msg='{name} are mutually exclusive (XOR): use either --n-parallel-batch or --n-parallel-continuous')
     validate_positive('playlist start', opts.playliststart, True)
     if opts.playlistend != -1:
         validate_minmax(opts.playliststart, opts.playlistend, 'playlist start', 'playlist end')
@@ -847,6 +856,8 @@ def parse_options(argv=None):
         'skip_unavailable_fragments': opts.skip_unavailable_fragments,
         'keep_fragments': opts.keep_fragments,
         'concurrent_fragment_downloads': opts.concurrent_fragment_downloads,
+        'n_parallel': opts.n_parallel or 1,
+        'n_parallel_mode': 'batch' if opts.n_parallel_batch else 'continuous',
         'buffersize': opts.buffersize,
         'noresizebuffer': opts.noresizebuffer,
         'http_chunk_size': opts.http_chunk_size,

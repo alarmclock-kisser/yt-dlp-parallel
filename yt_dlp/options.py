@@ -1013,6 +1013,29 @@ def create_parser():
         dest='concurrent_fragment_downloads', metavar='N', default=1, type=int,
         help='Number of fragments of a dash/hlsnative video that should be downloaded concurrently (default is %default)')
     downloader.add_option(
+        '--n-parallel',
+        dest='n_parallel', metavar='N', default=None, type=int,
+        help=(
+            'Download N videos in parallel (playlist entries / multiple URLs). '
+            'Unlike -N/--concurrent-fragments, which parallelizes fragments within a single video, '
+            '--n-parallel parallelizes whole videos. Combinable with -N: X parallel downloads '
+            'with Y concurrent fragments each. Default mode is continuous pool scheduling; '
+            'see --n-parallel-batch and --n-parallel-continuous'))
+    downloader.add_option(
+        '--n-parallel-batch',
+        action='store_true', dest='n_parallel_batch', default=False,
+        help=(
+            'Batch mode for --n-parallel: always start groups of N downloads together and only '
+            'start the next group once all downloads of the current group are finished. '
+            'Only valid together with --n-parallel and mutually exclusive with --n-parallel-continuous'))
+    downloader.add_option(
+        '--n-parallel-continuous',
+        action='store_true', dest='n_parallel_continuous', default=False,
+        help=(
+            'Continuous pool-scheduling mode for --n-parallel (default): keep N downloads running, '
+            'starting further tasks whenever a slot frees up. '
+            'Only valid together with --n-parallel and mutually exclusive with --n-parallel-batch'))
+    downloader.add_option(
         '-r', '--limit-rate', '--rate-limit',
         dest='ratelimit', metavar='RATE',
         help='Maximum download rate in bytes per second, e.g. 50K or 4.2M')

@@ -1,4 +1,5 @@
 import collections
+import concurrent.futures
 import contextlib
 import copy
 import datetime as dt
@@ -19,6 +20,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tokenize
 import traceback
@@ -291,6 +293,16 @@ class YoutubeDL:
                        Default is 'only_download' for CLI, but False for API
     skip_playlist_after_errors: Number of allowed failures until the rest of
                        the playlist is skipped
+    n_parallel:      Number of videos to download in parallel (playlist entries /
+                       multiple URLs). Unlike concurrent_fragment_downloads
+                       (-N), which parallelizes fragments within a single video,
+                       n_parallel parallelizes whole videos. Combinable with -N:
+                       X parallel downloads with Y concurrent fragments each.
+    n_parallel_mode: 'batch' or 'continuous' (default 'continuous').
+                       batch = always start groups of N downloads together and only
+                       start the next group once all of the current group finished.
+                       continuous = pool scheduling: keep N downloads running,
+                       starting further tasks whenever a slot frees up.
     allowed_extractors:  List of regexes to match against extractor names that are allowed
     overwrites:        Overwrite all video and metadata files if True,
                        overwrite only non-video files if None
@@ -653,6 +665,11 @@ class YoutubeDL:
         self._num_videos = 0
         self._playlist_level = 0
         self._playlist_urls = set()
+        # Locks for --n-parallel thread-safe operation (-np fork):
+        # _np_lock guards counters/retcode/archive-set/printed-messages,
+        # _np_output_lock serializes console output to avoid interleaved lines.
+        self._np_lock = threading.RLock()
+        self._np_output_lock = threading.RLock()
         self.cache = Cache(self)
         self.__header_cookies = []
 
@@ -982,11 +999,14 @@ class YoutubeDL:
         return res[:-len('\n')]
 
     def _write_string(self, message, out=None, only_once=False):
-        if only_once:
-            if message in self._printed_messages:
-                return
-            self._printed_messages.add(message)
-        write_string(message, out=out, encoding=self.params.get('encoding'))
+        # Thread-safe for --n-parallel: serialize console output and guard only_once set
+        with self._np_output_lock:
+            if only_once:
+                with self._np_lock:
+                    if message in self._printed_messages:
+                        return
+                    self._printed_messages.add(message)
+            write_string(message, out=out, encoding=self.params.get('encoding'))
 
     def to_stdout(self, message, skip_eol=False, quiet=None):
         """Print message to stdout"""
@@ -1100,7 +1120,8 @@ class YoutubeDL:
             else:
                 exc_info = sys.exc_info()
             raise DownloadError(message, exc_info)
-        self._download_retcode = 1
+        with self._np_lock:
+            self._download_retcode = 1
 
     Styles = Namespace(
         HEADERS='yellow',
@@ -2077,6 +2098,57 @@ class YoutubeDL:
             'extractor_key': ie_result['extractor_key'],
         }
 
+    # --n-parallel (-np fork): parallel download of multiple videos -----------------
+    def _get_n_parallel(self):
+        try:
+            n = int(self.params.get('n_parallel') or 1)
+        except (TypeError, ValueError):
+            n = 1
+        return max(1, n)
+
+    def _get_n_parallel_mode(self):
+        mode = (self.params.get('n_parallel_mode') or 'continuous').lower()
+        return 'batch' if mode == 'batch' else 'continuous'
+
+    def _run_parallel_tasks(self, func, items):
+        """Run func(item) for each item in items using batch or continuous scheduling.
+
+        func must be thread-safe (YoutubeDL shared instance is guarded by _np_lock
+        for counters/archive/output). Expected download errors are handled inside
+        func (via report_error/trouble, like the serial path) and result in a
+        None/falsey return value. Unexpected exceptions (e.g. DownloadError when
+        not ignoreerrors, DownloadCancelled for break_on_* / max_downloads) are
+        re-raised in the main thread after pending tasks settle, preserving
+        serial exit-code semantics.
+
+        Returns list of results in input order.
+        """
+        n = self._get_n_parallel()
+        mode = self._get_n_parallel_mode()
+        if n <= 1 or len(items) <= 1:
+            return [func(item) for item in items]
+
+        results = [None] * len(items)
+
+        if mode == 'batch':
+            # Batch: groups of N started together; next group only after all of current finished
+            for start in range(0, len(items), n):
+                chunk = list(enumerate(items[start:start + n], start=start))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=n, thread_name_prefix='yt-dlp-np') as ex:
+                    future_to_idx = {ex.submit(func, item): idx for idx, item in chunk}
+                    for future in concurrent.futures.as_completed(future_to_idx):
+                        idx = future_to_idx[future]
+                        results[idx] = future.result()  # re-raises break/fatal errors in main thread
+            return results
+
+        # Continuous (default): pool scheduling, keep N running, start next when slot frees
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n, thread_name_prefix='yt-dlp-np') as ex:
+            future_to_idx = {ex.submit(func, item): idx for idx, item in enumerate(items)}
+            for future in concurrent.futures.as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                results[idx] = future.result()
+        return results
+
     def __process_playlist(self, ie_result, download):
         """Process each entry in the playlist"""
         assert ie_result['_type'] in ('playlist', 'multi_video')
@@ -2139,44 +2211,170 @@ class YoutubeDL:
 
         failures = 0
         max_failures = self.params.get('skip_playlist_after_errors') or float('inf')
-        for i, (playlist_index, entry) in enumerate(entries):
-            if lazy:
-                resolved_entries.append((playlist_index, entry))
+        n_parallel = self._get_n_parallel()
+        n_parallel_mode = self._get_n_parallel_mode()
+        use_parallel = (
+            download and n_parallel > 1 and not lazy
+            and isinstance(resolved_entries, list) and len(resolved_entries) > 1
+            and not self.params.get('extract_flat') in ('in_playlist', True)
+            and self._playlist_level <= 1
+        )
+        if lazy and n_parallel > 1 and download:
+            self.report_warning(
+                '--n-parallel is not supported with --flat-playlist --lazy-playlist; falling back to serial download',
+                only_once=True)
+
+        def _prepare_task(i, playlist_index, entry):
             if not entry:
-                continue
-
+                return None
             entry['__x_forwarded_for_ip'] = ie_result.get('__x_forwarded_for_ip')
+            eff_index = playlist_index
             if not lazy and 'playlist-index' in self.params['compat_opts']:
-                playlist_index = ie_result['requested_entries'][i]
-
+                eff_index = ie_result['requested_entries'][i]
             entry_copy = collections.ChainMap(entry, {
                 **common_info,
                 'n_entries': int_or_none(n_entries),
-                'playlist_index': playlist_index,
+                'playlist_index': eff_index,
                 'playlist_autonumber': i + 1,
             })
-
             if self._match_entry(entry_copy, incomplete=True) is not None:
-                # For compatabilty with youtube-dl. See https://github.com/yt-dlp/yt-dlp/issues/4369
-                resolved_entries[i] = (playlist_index, NO_DEFAULT)
-                continue
+                return ('filtered', i, eff_index)
+            extra_info = collections.ChainMap({
+                'playlist_index': eff_index,
+                'playlist_autonumber': i + 1,
+            }, extra)
+            return ('task', i, eff_index, entry, extra_info)
 
+        def _run_entry(task):
+            kind = task[0]
+            if kind != 'task':
+                return task
+            _, i, eff_index, entry, extra_info = task
             self.to_screen(
                 f'[download] Downloading item {self._format_screen(i + 1, self.Styles.ID)} '
                 f'of {self._format_screen(n_entries, self.Styles.EMPHASIS)}')
+            entry_result = self.__process_iterable_entry(entry, download, extra_info)
+            return ('done', i, eff_index, entry_result)
 
-            entry_result = self.__process_iterable_entry(entry, download, collections.ChainMap({
-                'playlist_index': playlist_index,
-                'playlist_autonumber': i + 1,
-            }, extra))
-            if not entry_result:
-                failures += 1
-            if failures >= max_failures:
-                self.report_error(
-                    f'Skipping the remaining entries in playlist "{title}" since {failures} items failed extraction')
-                break
-            if keep_resolved_entries:
-                resolved_entries[i] = (playlist_index, entry_result)
+        if not use_parallel:
+            for i, (playlist_index, entry) in enumerate(entries):
+                if lazy:
+                    resolved_entries.append((playlist_index, entry))
+                if not entry:
+                    continue
+
+                entry['__x_forwarded_for_ip'] = ie_result.get('__x_forwarded_for_ip')
+                if not lazy and 'playlist-index' in self.params['compat_opts']:
+                    playlist_index = ie_result['requested_entries'][i]
+
+                entry_copy = collections.ChainMap(entry, {
+                    **common_info,
+                    'n_entries': int_or_none(n_entries),
+                    'playlist_index': playlist_index,
+                    'playlist_autonumber': i + 1,
+                })
+
+                if self._match_entry(entry_copy, incomplete=True) is not None:
+                    # For compatabilty with youtube-dl. See https://github.com/yt-dlp/yt-dlp/issues/4369
+                    resolved_entries[i] = (playlist_index, NO_DEFAULT)
+                    continue
+
+                self.to_screen(
+                    f'[download] Downloading item {self._format_screen(i + 1, self.Styles.ID)} '
+                    f'of {self._format_screen(n_entries, self.Styles.EMPHASIS)}')
+
+                entry_result = self.__process_iterable_entry(entry, download, collections.ChainMap({
+                    'playlist_index': playlist_index,
+                    'playlist_autonumber': i + 1,
+                }, extra))
+                if not entry_result:
+                    failures += 1
+                if failures >= max_failures:
+                    self.report_error(
+                        f'Skipping the remaining entries in playlist "{title}" since {failures} items failed extraction')
+                    break
+                if keep_resolved_entries:
+                    resolved_entries[i] = (playlist_index, entry_result)
+        else:
+            self.to_screen(
+                f'[parallel] Downloading {n_entries} items with --n-parallel {n_parallel} '
+                f'({n_parallel_mode} mode, -N {self.params.get("concurrent_fragment_downloads", 1)} fragments each)')
+            prepared = [_prepare_task(i, pi, e) for i, (pi, e) in enumerate(entries)]
+            # Apply match_filter decisions in main thread (serial, deterministic)
+            tasks = []
+            for p in prepared:
+                if p is None:
+                    continue
+                if p[0] == 'filtered':
+                    _, i, eff_index = p
+                    resolved_entries[i] = (eff_index, NO_DEFAULT)
+                    continue
+                tasks.append(p)
+
+            if n_parallel_mode == 'batch':
+                # Batch: groups of N started together; next group only after current fully finished
+                for start in range(0, len(tasks), n_parallel):
+                    if failures >= max_failures:
+                        self.report_error(
+                            f'Skipping the remaining entries in playlist "{title}" since {failures} items failed extraction')
+                        break
+                    chunk = tasks[start:start + n_parallel]
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=n_parallel, thread_name_prefix='yt-dlp-np') as ex:
+                        future_to_task = {ex.submit(_run_entry, t): t for t in chunk}
+                        # Drain full batch even if threshold is hit mid-batch (batch semantics),
+                        # then outer loop skips subsequent batches.
+                        for future in concurrent.futures.as_completed(future_to_task):
+                            # Break/fatal errors preserve serial semantics: propagate after batch settles
+                            result = future.result()
+                            _, i, eff_index, entry_result = result
+                            if not entry_result:
+                                failures += 1
+                            if keep_resolved_entries:
+                                resolved_entries[i] = (eff_index, entry_result)
+                        if failures >= max_failures and start + n_parallel < len(tasks):
+                            self.report_error(
+                                f'Skipping the remaining entries in playlist "{title}" since {failures} items failed extraction')
+                            break
+            else:
+                # Continuous (default) pool scheduling: keep N running, start next when a slot frees.
+                # Refill pattern: submit N initially, submit one more per completion until queue empty.
+                # This also allows best-effort early stop on skip_playlist_after_errors.
+                import collections as _collections
+                pending = _collections.deque(tasks)
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=n_parallel, thread_name_prefix='yt-dlp-np') as ex:
+                    in_flight = {}
+                    for _ in range(min(n_parallel, len(pending))):
+                        t = pending.popleft()
+                        f = ex.submit(_run_entry, t)
+                        in_flight[f] = t
+                    stop_submitting = False
+                    while in_flight:
+                        done, _ = concurrent.futures.wait(
+                            in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+                        for future in done:
+                            in_flight.pop(future)
+                            # Break/fatal errors preserve serial semantics: cancel queued + pending,
+                            # drain running, then re-raise.
+                            result = future.result()
+                            _, i, eff_index, entry_result = result
+                            if not entry_result:
+                                failures += 1
+                            if keep_resolved_entries:
+                                resolved_entries[i] = (eff_index, entry_result)
+                            if failures >= max_failures and (pending or in_flight):
+                                self.report_error(
+                                    f'Skipping the remaining entries in playlist "{title}" since {failures} items failed extraction')
+                                pending.clear()
+                                stop_submitting = True
+                        if stop_submitting:
+                            # Drain running tasks (record their results) without submitting new ones
+                            continue
+                        while pending and len(in_flight) < n_parallel:
+                            t = pending.popleft()
+                            f = ex.submit(_run_entry, t)
+                            in_flight[f] = t
 
         # Update with processed data
         ie_result['entries'] = [e for _, e in resolved_entries if e is not NO_DEFAULT]
@@ -2834,7 +3032,8 @@ class YoutubeDL:
 
     def process_video_result(self, info_dict, download=True):
         assert info_dict.get('_type', 'video') == 'video'
-        self._num_videos += 1
+        with self._np_lock:
+            self._num_videos += 1
 
         if 'id' not in info_dict:
             raise ExtractorError('Missing "id" field in extractor result', ie=info_dict['extractor'])
@@ -3356,7 +3555,8 @@ class YoutubeDL:
 
         new_info, _ = self.pre_process(info_dict, 'video')
         replace_info_dict(new_info)
-        self._num_downloads += 1
+        with self._np_lock:
+            self._num_downloads += 1
 
         # info_dict['_filename'] needs to be set for backward compatibility
         info_dict['_filename'] = full_filename = self.prepare_filename(info_dict, warn=True)
@@ -3691,7 +3891,8 @@ class YoutubeDL:
                 self.to_screen(f'[info] {e}')
                 if not self.params.get('break_per_url'):
                     raise
-                self._num_downloads = 0
+                with self._np_lock:
+                    self._num_downloads = 0
             else:
                 if self.params.get('dump_single_json', False):
                     self.post_extract(res)
@@ -3708,9 +3909,31 @@ class YoutubeDL:
                 and self.params.get('max_downloads') != 1):
             raise SameFileError(outtmpl)
 
-        for url in url_list:
-            self.__download_wrapper(self.extract_info)(
-                url, force_generic_extractor=self.params.get('force_generic_extractor', False))
+        n_parallel = self._get_n_parallel()
+        if n_parallel > 1 and len(url_list) > 1:
+            mode = self._get_n_parallel_mode()
+            self.to_screen(
+                f'[parallel] Downloading {len(url_list)} URLs with --n-parallel {n_parallel} '
+                f'({mode} mode)')
+            force_generic = self.params.get('force_generic_extractor', False)
+
+            def _dl(url):
+                return self.__download_wrapper(self.extract_info)(url, force_generic_extractor=force_generic)
+
+            if mode == 'batch':
+                for start in range(0, len(url_list), n_parallel):
+                    chunk = url_list[start:start + n_parallel]
+                    with concurrent.futures.ThreadPoolExecutor(
+                            max_workers=n_parallel, thread_name_prefix='yt-dlp-np') as ex:
+                        list(ex.map(_dl, chunk))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=n_parallel, thread_name_prefix='yt-dlp-np') as ex:
+                    list(ex.map(_dl, url_list))
+        else:
+            for url in url_list:
+                self.__download_wrapper(self.extract_info)(
+                    url, force_generic_extractor=self.params.get('force_generic_extractor', False))
 
         return self._download_retcode
 
@@ -3878,7 +4101,8 @@ class YoutubeDL:
 
         vid_ids = [self._make_archive_id(info_dict)]
         vid_ids.extend(info_dict.get('_old_archive_ids') or [])
-        return any(id_ in self.archive for id_ in vid_ids)
+        with self._np_lock:
+            return any(id_ in self.archive for id_ in vid_ids)
 
     def record_download_archive(self, info_dict):
         fn = self.params.get('download_archive')
@@ -3891,7 +4115,8 @@ class YoutubeDL:
         if is_path_like(fn):
             with locked_file(fn, 'a', encoding='utf-8') as archive_file:
                 archive_file.write(vid_id + '\n')
-        self.archive.add(vid_id)
+        with self._np_lock:
+            self.archive.add(vid_id)
 
     @staticmethod
     def format_resolution(format, default='unknown'):
